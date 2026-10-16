@@ -511,6 +511,14 @@ if(BUILD_TESTING)
         target_include_directories(guest_module_args_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs)
         set_target_properties(guest_module_args_host PROPERTIES
             PREFIX "" SUFFIX ".prx" WINDOWS_EXPORT_ALL_SYMBOLS ON)
+        foreach(provider IN ITEMS libc kernel)
+            add_library(guest_module_args_${provider} SHARED elfpatcher/tests/GuestModuleArgsHost.cpp)
+            target_include_directories(guest_module_args_${provider} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs)
+            string(TOUPPER "${provider}" provider_upper)
+            target_compile_definitions(guest_module_args_${provider} PRIVATE APS5_TEST_${provider_upper}_ONLY)
+            set_target_properties(guest_module_args_${provider} PROPERTIES
+                PREFIX "" SUFFIX ".prx" WINDOWS_EXPORT_ALL_SYMBOLS ON)
+        endforeach()
         add_test(NAME guest_module_args COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_module_args.py
             $<TARGET_FILE:relinker> $<TARGET_FILE:guest_module_args_host>)
@@ -531,7 +539,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_needed_nested_modules.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_zero_initializer COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_zero_initializer.py
-            $<TARGET_FILE:relinker> $<TARGET_FILE:guest_module_args_host>)
+            $<TARGET_FILE:relinker> $<TARGET_FILE:guest_module_args_host>
+            $<TARGET_FILE:guest_module_args_libc> $<TARGET_FILE:guest_module_args_kernel>)
         set_tests_properties(guest_zero_initializer PROPERTIES TIMEOUT 30)
         set(windows_stdio_host_arguments)
         if(WIN32)

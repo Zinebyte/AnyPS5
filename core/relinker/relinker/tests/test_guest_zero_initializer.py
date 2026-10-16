@@ -8,8 +8,9 @@ import tempfile
 
 from guest_import_fixtures import executable
 from test_guest_intel_trampolines import main_fixture, pe_sections
-from test_guest_module_args import ARGP, ARGS, GETTER, RETURNED, SETTER, macho_binds
-from test_guest_module_dir import pe_export_names
+from test_guest_module_args import ARGP, ARGS, GETTER, RETURNED, SETTER, args_module, macho_binds
+from test_guest_module_dir import host_module, pe_export_names
+from test_guest_module_directories import needed_libraries
 from test_guest_symbol_names import dynamic_tags, imported_symbols
 
 PREINIT_SLOT = 0x2900
@@ -84,7 +85,69 @@ def convert(relinker, work, preinit, options, base=0):
     return output, work / 'app0' / 'sce_module' / (name + '.guest.prx')
 
 
+def check_initializer_hosts(relinker, work, libc, kernel, native):
+    for initializer in ('zero', 'nonzero', 'absent'):
+        for deferred in (False, True):
+            case = work / f'hosts-{initializer}-{deferred}'
+            modules, plugins = case / 'sce_module', case / 'plugins'
+            modules.mkdir(parents=True)
+            plugins.mkdir()
+            image = zero_init_module(False) if initializer == 'zero' else args_module()
+            if initializer == 'absent':
+                tags = [(tag, value) for tag, value in dynamic_tags(image).items() if tag != 12] + [(0, 0)]
+                for index, tag in enumerate(tags):
+                    struct.pack_into('<qQ', image, 0x2000 + index * 16, *tag)
+                struct.pack_into('<QQ', image, 120 + 32, len(tags) * 16, len(tags) * 16)
+            (plugins if deferred else modules).joinpath('initializer.prx').write_bytes(image)
+            (plugins / 'decoy.prx').write_bytes(host_module((b'libOptional.prx',)))
+            source, output = case / 'input.elf', case / 'output.elf'
+            image = main_fixture()
+            image[0x4000:0x400c] = bytes.fromhex('b83c000000bf2a0000000f05')
+            source.write_bytes(image)
+            result = subprocess.run([str(relinker), '--skip-syscall-check', '--module-dir', 'plugins',
+                                     str(source), str(output)], capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, (initializer, deferred, result.stdout, result.stderr)
+            relative = 'plugins' if deferred else 'sce_module'
+            converted = case / 'app0' / relative / 'initializer.prx.guest.prx'
+            dependencies = ['libc.prx'] + ([] if initializer == 'absent' else ['libkernel.prx'])
+            assert needed_libraries(converted.read_bytes()) == dependencies, (initializer, deferred, needed_libraries(converted.read_bytes()))
+            startup = [] if deferred else ['$ORIGIN/app0/sce_module/initializer.prx.guest.prx', *dependencies]
+            assert needed_libraries(output.read_bytes()) == startup, (initializer, deferred, needed_libraries(output.read_bytes()))
+            if not native:
+                continue
+            libraries = case / 'libs'
+            libraries.mkdir()
+            shutil.copyfile(libc, libraries / 'libc.prx')
+            if initializer != 'absent':
+                shutil.copyfile(kernel, libraries / 'libkernel.prx')
+            events = case / 'events.txt'
+            environment = {**os.environ, 'ANYPS5_GUEST_MODULE_ARGS': str(events)}
+            command = [sys.executable, __file__, '--load-isolated', str(converted)]
+            output.chmod(0o755)
+            run = subprocess.run([str(output)], env=environment, capture_output=True, text=True, timeout=10)
+            assert run.returncode == 42, (initializer, deferred, run.returncode, run.stdout, run.stderr)
+            if deferred:
+                assert not events.exists(), (initializer, events.read_text())
+                run = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=10)
+                assert run.returncode == 0, (initializer, run.returncode, run.stdout, run.stderr)
+            expected = '' if initializer == 'absent' else f'args=0000000000000000 argp=0000000000000000\nresult={RETURNED}\n'
+            assert (events.read_text() if events.exists() else '') == expected, (initializer, deferred, expected)
+            for dependency in dependencies:
+                provider = libraries / dependency
+                unavailable = provider.with_suffix('.unavailable')
+                provider.rename(unavailable)
+                try:
+                    run = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=10)
+                    assert run.returncode != 0 and dependency in run.stderr, (initializer, dependency, run.returncode, run.stdout, run.stderr)
+                finally:
+                    unavailable.rename(provider)
+
+
 def main():
+    if sys.argv[1] == '--load-isolated':
+        import ctypes
+        ctypes.CDLL(sys.argv[2])
+        return
     if sys.argv[1] == '--load':
         import ctypes
         host = ctypes.CDLL(sys.argv[2])
@@ -97,6 +160,7 @@ def main():
     linux = sys.platform == 'linux' and os.uname().machine == 'x86_64'
     with tempfile.TemporaryDirectory(prefix='anyps5-guest-zero-init-') as directory:
         work = Path(directory)
+        check_initializer_hosts(relinker, work, Path(sys.argv[3]).resolve(), Path(sys.argv[4]).resolve(), linux)
         for preinit in (True, False):
             _, converted = convert(relinker, work / f'linux-{preinit}', preinit, [])
             image = converted.read_bytes()
@@ -128,6 +192,7 @@ def main():
                 libraries.mkdir()
                 provider = libraries / 'libc.prx'
                 shutil.copyfile(host, provider)
+                shutil.copyfile(host, libraries / 'libkernel.prx')
                 events = case / 'events.txt'
                 run = subprocess.run([sys.executable, __file__, '--load', str(provider), str(converted)],
                                      env={**os.environ, 'ANYPS5_GUEST_MODULE_ARGS': str(events)},
